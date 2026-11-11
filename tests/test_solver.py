@@ -1,4 +1,6 @@
-"""求解器自检：直接运行 `python3 tests/test_solver.py`（仅依赖标准库 + tzdata）。"""
+"""求解器自检：直接运行 `python3 -I tests/test_solver.py`（仅依赖标准库 + tzdata）。"""
+import io
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -6,10 +8,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.solver import (  # noqa: E402
-    build_export_csv, solve_csv, utc_candidates,
+    build_export_csv,
+    export_rows,
+    iter_csv_rows,
+    read_rows,
+    solve_csv,
+    solve_tail,
+    utc_candidates,
 )
 
 SAMPLE = Path(__file__).resolve().parents[1] / "samples" / "dst_sample.csv"
+SMALL_INTERLEAVED = (
+    Path(__file__).resolve().parents[1] / "samples" / "interleaved_small.csv"
+)
 
 
 def check(name, cond):
@@ -56,6 +67,48 @@ def main():
     lines = [l for l in csv_out.strip().splitlines()]
     check("导出 CSV 行数 = 表头 + B-7001(3) + B-7005(2)", len(lines) == 1 + 3 + 2)
     check("导出 CSV 不含多解机尾 B-7004", "B-7004" not in csv_out)
+
+    # 5) 流式生成器导出与一次性导出内容一致，且逐行产出
+    streamed = "".join(export_rows(result, ["B-7001", "B-7004", "B-7005"]))
+    check("流式导出生成器与一次性导出一致", streamed == csv_out)
+    chunks = list(export_rows(result, ["B-7001"]))
+    check("流式导出为多块逐行产出", len(chunks) > 1 and chunks[0].startswith("tail_number"))
+
+    # 6) 流式 CSV 读取与一次性读取等价
+    text = SAMPLE.read_text(encoding="utf-8")
+    stream_rows = list(iter_csv_rows(io.StringIO(text)))
+    check("iter_csv_rows 与 read_rows 行数一致",
+          len(stream_rows) == len(read_rows(text)))
+    check("流式行号从 1 连续编号",
+          [r.row_number for r in stream_rows] == list(range(1, len(stream_rows) + 1)))
+
+    # 7) 交错输入：随机打乱数据行后，逐机尾结果与原顺序完全一致
+    raw_lines = text.splitlines(keepends=True)
+    header, body = raw_lines[0], raw_lines[1:]
+    rng = random.Random(20261111)
+    rng.shuffle(body)
+    shuffled = solve_csv(header + "".join(body))
+    orig_by = {t["tail"]: t for t in result["tails"]}
+    shuf_by = {t["tail"]: t for t in shuffled["tails"]}
+    check("打乱行序后机尾集合不变",
+          set(orig_by) == set(shuf_by))
+    check("打乱行序后各机尾状态不变",
+          all(orig_by[k]["status"] == shuf_by[k]["status"] for k in orig_by))
+    check("打乱行序后唯一解内容不变",
+          all(orig_by[k].get("solution") == shuf_by[k].get("solution")
+              for k in orig_by if orig_by[k]["status"] == "unique"))
+
+    # 8) 无 DST 歧义的交错样例：所有机尾整链唯一解
+    if SMALL_INTERLEAVED.exists():
+        il = solve_csv(SMALL_INTERLEAVED.read_text(encoding="utf-8"))
+        check("交错样例全部为唯一解",
+              il["summary"]["total_tails"] == il["summary"]["unique"]
+              and il["summary"]["unique"] > 0)
+        first_tail = il["tails"][0]["tail"]
+        grouped = solve_tail(first_tail, [
+            r for r in iter_csv_rows(io.StringIO(SMALL_INTERLEAVED.read_text()))
+            if r.tail == first_tail])
+        check("交错样例单机尾重算仍唯一解", grouped["status"] == "unique")
 
     print("\n全部自检通过 ✅")
 

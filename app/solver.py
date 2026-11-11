@@ -1,4 +1,4 @@
-"""航段链 UTC 求解核心逻辑。
+"""航段链 UTC 求解核心逻辑（纯标准库，支持流式/逐机尾处理）。
 
 业务规则
 --------
@@ -8,6 +8,13 @@
 - 飞行时长（落地 - 起飞）必须落在闭区间 [duration_min_minutes, duration_max_minutes]；
 - 同一机尾按 seq 升序链接：下一段起飞不得早于上一段落地（相等允许）；
 - 整链恰好唯一解才允许导出；无解展示冲突航段，多解展示可行候选。
+
+内存友好设计
+------------
+- :func:`iter_csv_rows` 接收任意文本行迭代器（如逐行读取的文件对象），
+  不要求一次性持有整份 CSV 文本；
+- :func:`solve_tail` 只处理单架机尾的行，调用方可以按机尾逐个求解；
+- :func:`export_rows` 以生成器逐行产出导出 CSV，不缓冲整份导出内容。
 """
 from __future__ import annotations
 
@@ -39,6 +46,8 @@ _DT_FORMATS = (
 SOLUTION_CAP = 200
 # 多解时返回给前端展示的候选条数
 MAX_DISPLAY_SOLUTIONS = 20
+
+EXPORT_HEADER = ["tail_number", "seq", "dep_utc", "arr_utc", "duration_minutes"]
 
 
 class CsvFormatError(Exception):
@@ -97,7 +106,7 @@ def utc_candidates(naive: datetime, tz_name: str):
 
 @dataclass
 class RawRow:
-    row_number: int  # 数据行号（表头为第 0 行，数据从 1 起）
+    row_number: int  # 数据行号（表头为第 0 行，数据从 1 起，空行不计数）
     tail: str
     seq_raw: str
     dep_local_raw: str
@@ -134,15 +143,30 @@ class Segment:
 
 
 # ---------------------------------------------------------------------------
-# CSV 读取与行级校验
+# CSV 流式读取与行级校验
 # ---------------------------------------------------------------------------
 
 def read_rows(csv_text: str) -> list:
-    reader = csv.reader(io.StringIO(csv_text))
-    rows = [r for r in reader if any(cell.strip() for cell in r)]
-    if not rows:
+    """一次性读取整份 CSV 文本（保留给测试/小文件使用）。"""
+    return list(iter_csv_rows(io.StringIO(csv_text)))
+
+
+def iter_csv_rows(line_iter):
+    """流式解析 CSV：输入为文本行可迭代对象（文件对象/StringIO 均可）。
+
+    生成 :class:`RawRow`，逐行产出，调用方无需把整份 CSV 留在内存。
+    表头缺失/缺列/无数据行时抛出 :class:`CsvFormatError`。
+    """
+    reader = csv.reader(line_iter)
+    header_row = None
+    for r in reader:
+        if any(cell.strip() for cell in r):
+            header_row = r
+            break
+    if header_row is None:
         raise CsvFormatError("CSV 内容为空")
-    header = [c.strip().lower().lstrip("﻿") for c in rows[0]]
+
+    header = [c.strip().lower().lstrip("﻿") for c in header_row]
     missing = [c for c in REQUIRED_COLUMNS if c not in header]
     if missing:
         raise CsvFormatError(
@@ -155,10 +179,13 @@ def read_rows(csv_text: str) -> list:
         j = idx[name]
         return r[j].strip() if j < len(r) else ""
 
-    out = []
-    for i, r in enumerate(rows[1:], start=1):
-        out.append(RawRow(
-            row_number=i,
+    yielded = 0
+    for r in reader:
+        if not any(cell.strip() for cell in r):
+            continue
+        yielded += 1
+        yield RawRow(
+            row_number=yielded,
             tail=get(r, "tail_number"),
             seq_raw=get(r, "seq"),
             dep_local_raw=get(r, "dep_local"),
@@ -167,10 +194,9 @@ def read_rows(csv_text: str) -> list:
             arr_tz=get(r, "arr_tz"),
             dur_min_raw=get(r, "duration_min_minutes"),
             dur_max_raw=get(r, "duration_max_minutes"),
-        ))
-    if not out:
+        )
+    if yielded == 0:
         raise CsvFormatError("CSV 没有任何数据行")
-    return out
 
 
 def _parse_minutes(raw: str):
@@ -362,7 +388,16 @@ def _solution_view(solution, segments) -> list:
     ]
 
 
+def tail_summary(tail: str, status: str, rows: int, extra: dict | None = None) -> dict:
+    """机尾级轻量视图（不含明细），用于全批列表与懒加载。"""
+    out = {"tail": tail, "status": status, "row_count": rows}
+    if extra:
+        out.update(extra)
+    return out
+
+
 def solve_tail(tail: str, raws: list) -> dict:
+    """对单架机尾的行做完整求解，返回带明细的完整结果 dict。"""
     errors = []
     segments = []
     for raw in raws:
@@ -372,16 +407,20 @@ def solve_tail(tail: str, raws: list) -> dict:
         else:
             segments.append(seg)
     if errors:
-        return {"tail": tail, "status": "error", "errors": errors}
+        return {"tail": tail, "status": "error", "errors": errors,
+                "row_count": len(raws)}
 
     seqs = [s.seq for s in segments]
     if len(set(seqs)) != len(seqs):
         dup = sorted({s for s in seqs if seqs.count(s) > 1})
-        return {"tail": tail, "status": "error", "errors": [
-            {"row": None, "messages": [f"机尾 {tail} 的航段顺序 seq 重复: {dup}"]}]}
+        return {"tail": tail, "status": "error", "row_count": len(raws),
+                "errors": [
+                    {"row": None, "messages": [f"机尾 {tail} 的航段顺序 seq 重复: {dup}"]}]}
 
+    # 交错输入不要求预先排序：组内仍按 seq 升序做整链判定
     segments.sort(key=lambda s: s.seq)
-    base = {"tail": tail, "segments": [_segment_view(s) for s in segments]}
+    base = {"tail": tail, "row_count": len(raws),
+            "segments": [_segment_view(s) for s in segments]}
 
     solutions, truncated = enumerate_solutions(segments)
     if len(solutions) == 1:
@@ -400,16 +439,39 @@ def solve_tail(tail: str, raws: list) -> dict:
     }
 
 
+def summarize_tail(full_result: dict) -> dict:
+    """把完整求解结果压缩成机尾级摘要（供全批统计列表使用）。"""
+    status = full_result["status"]
+    extra = {}
+    if status == "no_solution":
+        c = full_result.get("conflict") or {}
+        extra["conflict_seq"] = c.get("segment_seq")
+        extra["conflict_row"] = c.get("row")
+    elif status == "multiple":
+        extra["solution_count"] = full_result["solution_count"]
+        extra["solution_count_truncated"] = full_result.get(
+            "solution_count_truncated", False)
+    elif status == "error":
+        extra["error_count"] = len(full_result.get("errors", []))
+    return tail_summary(full_result["tail"], status,
+                        full_result.get("row_count", len(full_result.get("segments", []))),
+                        extra)
+
+
 def solve_csv(csv_text: str) -> dict:
-    """主入口：解析 CSV 文本，按机尾分组求解，返回完整结果 dict。"""
-    raws = read_rows(csv_text)
+    """主入口：解析 CSV 文本，按机尾分组求解，返回完整结果 dict。
+
+    小文件/测试用；大文件请走 app.pipeline 的流式管道。
+    """
     tails: dict = {}
-    for raw in raws:
+    total_rows = 0
+    for raw in iter_csv_rows(io.StringIO(csv_text)):
         tails.setdefault(raw.tail, []).append(raw)
+        total_rows += 1
 
     results = [solve_tail(tail, group) for tail, group in tails.items()]
     summary = {
-        "rows": len(raws),
+        "rows": total_rows,
         "total_tails": len(results),
         "unique": sum(1 for r in results if r["status"] == "unique"),
         "no_solution": sum(1 for r in results if r["status"] == "no_solution"),
@@ -421,13 +483,22 @@ def solve_csv(csv_text: str) -> dict:
 
 def build_export_csv(solve_result: dict, tails: list) -> str:
     """为已确认唯一解的机尾生成 UTC CSV（列：机尾、顺序、起降 UTC、时长）。"""
+    return "".join(export_rows(solve_result, tails))
+
+
+def export_rows(solve_result: dict, tails: list):
+    """生成器版本：逐行产出导出 CSV，避免在内存中缓冲整份导出内容。"""
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
-    writer.writerow(["tail_number", "seq", "dep_utc", "arr_utc", "duration_minutes"])
+    writer.writerow(EXPORT_HEADER)
+    yield buf.getvalue()
+
     wanted = set(tails)
     for t in solve_result["tails"]:
         if t["tail"] in wanted and t["status"] == "unique":
             for item in t["solution"]:
-                writer.writerow([t["tail"], item["seq"], item["dep_utc"],
-                                 item["arr_utc"], item["duration_minutes"]])
-    return buf.getvalue()
+                buf = io.StringIO()
+                csv.writer(buf, lineterminator="\n").writerow(
+                    [t["tail"], item["seq"], item["dep_utc"],
+                     item["arr_utc"], item["duration_minutes"]])
+                yield buf.getvalue()

@@ -52,6 +52,17 @@
   .chip.green { color: #7ee2a0; border-color: var(--green); }
   .chip.red { color: #ff9d97; border-color: var(--red); }
   .chip.amber { color: #f0c36d; border-color: var(--amber); }
+  .tail-row {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; border: 1px solid var(--line); border-radius: 9px;
+    margin-bottom: 8px; background: var(--panel); cursor: pointer;
+  }
+  .tail-row:hover { border-color: var(--accent); }
+  .tail-row .tail-name { font-weight: 700; font-family: ui-monospace, Consolas, monospace; min-width: 110px; }
+  .tail-row .meta { color: var(--muted); font-size: 12.5px; }
+  .tail-row .caret { color: var(--accent); margin-left: auto; font-size: 12px; }
+  .tail-detail { margin: -2px 0 12px; padding: 4px 8px 12px; }
+  .tail-detail.loading, .tail-detail .note { color: var(--muted); }
   .tail-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .tail-head h2 { margin: 0; font-size: 17px; }
   .badge { padding: 3px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 700; }
@@ -60,16 +71,12 @@
   .badge.multiple { background: var(--amber-bg); color: #f0c36d; border: 1px solid var(--amber); }
   .badge.error { background: var(--red-bg); color: #ff9d97; border: 1px solid var(--red); }
   .note { color: var(--muted); font-size: 13px; }
-  .conflict-box {
+  .conflict-box, .error-box {
     background: var(--red-bg); border: 1px solid var(--red);
     border-radius: 8px; padding: 10px 14px; margin-top: 10px;
   }
   .warn-box {
     background: var(--amber-bg); border: 1px solid var(--amber);
-    border-radius: 8px; padding: 10px 14px; margin-top: 10px;
-  }
-  .error-box {
-    background: var(--red-bg); border: 1px solid var(--red);
     border-radius: 8px; padding: 10px 14px; margin-top: 10px;
   }
   .cand { color: var(--amber); }
@@ -84,17 +91,18 @@
 <body>
 <header>
   <h1>🛫 航段时间清洗 · DST 安全入仓</h1>
-  <p>把地服导出的「当地时间」航段解析为唯一 UTC 航段链，避免夏令时切换时错误入仓。</p>
+  <p>把地服导出的「当地时间」航段解析为唯一 UTC 航段链，避免夏令时切换时错误入仓。大文件按机尾流式处理，明细按需加载。</p>
 </header>
 <main>
   <div class="card">
     <div class="upload-bar">
       <input type="file" id="fileInput" accept=".csv,text/csv">
       <button class="secondary" id="sampleBtn">📦 载入内置夏令时样例</button>
+      <button class="secondary" id="interleavedBtn">🔀 载入交错样例（无 DST）</button>
       <button id="solveBtn" disabled>开始清洗</button>
       <span class="file-name" id="fileName">未选择文件</span>
       <span class="spacer"></span>
-      <button class="export" id="exportAllBtn" disabled>⬇ 导出全部可导出机尾</button>
+      <button class="export" id="exportAllBtn" disabled>⬇ 批量导出（仅唯一解机尾）</button>
     </div>
     <details>
       <summary>CSV 格式与求解规则</summary>
@@ -104,6 +112,7 @@
         <li><code>dep_local / arr_local</code>：当地时间，格式 <code>YYYY-MM-DD HH:MM</code>（不含时区偏移）；</li>
         <li><code>dep_tz / arr_tz</code>：IANA 时区名，如 <code>Europe/Berlin</code>、<code>America/New_York</code>；</li>
         <li><code>duration_*</code>：飞行时长下/上限（分钟，闭区间）；<code>seq</code> 为同一机尾内的航段顺序（整数，从 1 起）。</li>
+        <li>不同机尾的行可以<b>交错</b>出现、无需预先排序；服务端按机尾归集后仍按 seq 升序做整链判定。</li>
       </ul>
       <ul>
         <li>当地时间不存在（春季拨快空洞）→ 该行报错，整架机尾禁止导出；</li>
@@ -119,11 +128,12 @@
   <div id="summary"></div>
   <div id="results"></div>
 </main>
-<footer>仅整链唯一解的机尾允许入仓 · 重复时刻双候选求解 · 不存在时刻硬性报错</footer>
+<footer>仅整链唯一解的机尾允许入仓 · 按机尾流式求解 · 明细懒加载 · 导出时重新求解复核</footer>
 
 <script>
 let currentFile = null;
-let lastResult = null;
+let currentJob = null;          // 最近一次清洗的作业信息
+const detailCache = new Map();  // tail -> 明细，已展开过不重复请求
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g,
@@ -142,20 +152,32 @@ $('fileInput').addEventListener('change', (e) => {
   $('solveBtn').disabled = !currentFile;
 });
 
-$('sampleBtn').addEventListener('click', async () => {
-  const resp = await fetch('/api/sample');
-  const blob = await resp.blob();
-  currentFile = new File([blob], 'dst_sample.csv', {type: 'text/csv'});
-  $('fileName').textContent = '已载入内置样例 dst_sample.csv';
-  $('solveBtn').disabled = false;
-  $('fileInput').value = '';
-});
+async function loadRemoteSample(url, label) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error((await resp.json()).detail || '样例加载失败');
+    const blob = await resp.blob();
+    currentFile = new File([blob], label, {type: 'text/csv'});
+    $('fileName').textContent = '已载入' + label;
+    $('solveBtn').disabled = false;
+    $('fileInput').value = '';
+  } catch (err) {
+    showGlobalError('样例加载失败: ' + err);
+  }
+}
+
+$('sampleBtn').addEventListener('click',
+  () => loadRemoteSample('/api/sample', 'dst_sample.csv'));
+$('interleavedBtn').addEventListener('click',
+  () => loadRemoteSample('/api/sample/interleaved?tails=6&segments=8',
+                         'interleaved_6x8.csv'));
 
 $('solveBtn').addEventListener('click', async () => {
   hideGlobalError();
   $('results').innerHTML = '';
   $('summary').innerHTML = '';
   $('exportAllBtn').disabled = true;
+  detailCache.clear();
   const fd = new FormData();
   fd.append('file', currentFile);
   $('solveBtn').disabled = true;
@@ -163,8 +185,9 @@ $('solveBtn').addEventListener('click', async () => {
     const resp = await fetch('/api/solve', {method: 'POST', body: fd});
     const data = await resp.json();
     if (!resp.ok) { showGlobalError(data.detail || '求解失败'); return; }
-    lastResult = data;
-    render(data);
+    currentJob = data;
+    renderSummary(data);
+    renderTailList(data);
   } catch (err) {
     showGlobalError('请求失败: ' + err);
   } finally {
@@ -181,24 +204,97 @@ function showGlobalError(msg) {
 }
 function hideGlobalError() { $('global-error').style.display = 'none'; }
 
-function render(data) {
+// ---------------------------------------------------------------------------
+// 全批统计 + 机尾摘要列表（首屏不含任何明细）
+// ---------------------------------------------------------------------------
+function renderSummary(data) {
   const s = data.summary;
-  $('summary').innerHTML = `<div class="summary-chips">
-    <span class="chip">数据行 ${s.rows}</span>
-    <span class="chip">机尾 ${s.total_tails}</span>
-    <span class="chip green">唯一解 ${s.unique}</span>
-    <span class="chip red">无解 ${s.no_solution}</span>
-    <span class="chip amber">多解 ${s.multiple}</span>
-    <span class="chip red">错误 ${s.error}</span>
+  $('summary').innerHTML = `<div class="card">
+    <div class="summary-chips">
+      <span class="chip">数据行 ${s.rows}</span>
+      <span class="chip">机尾 ${s.total_tails}</span>
+      <span class="chip green">唯一解 ${s.unique}</span>
+      <span class="chip red">无解 ${s.no_solution}</span>
+      <span class="chip amber">多解 ${s.multiple}</span>
+      <span class="chip red">错误 ${s.error}</span>
+    </div>
+    <p class="note">文件：${esc(data.filename || '')}　·　点击任一机尾行才加载它的原有明细。</p>
   </div>`;
   $('exportAllBtn').disabled = s.unique === 0;
-  $('results').innerHTML = data.tails.map(renderTail).join('');
-  document.querySelectorAll('[data-export-tail]').forEach(btn => {
-    btn.addEventListener('click', () => doExport(btn.dataset.exportTail));
+}
+
+function renderTailList(data) {
+  $('results').innerHTML = data.tails.map((t, i) => {
+    const meta = STATUS_META[t.status];
+    const extra = summaryExtra(t);
+    return `
+    <div class="tail-row" data-tail="${esc(t.tail)}" data-idx="${i}">
+      <span class="tail-name">✈ ${esc(t.tail)}</span>
+      <span class="badge ${meta.cls}">${meta.label}</span>
+      <span class="meta">${t.row_count} 段${extra}</span>
+      <span class="caret">展开明细 ▾</span>
+    </div>
+    <div class="tail-detail" id="detail-${i}" hidden></div>`;
+  }).join('');
+
+  document.querySelectorAll('.tail-row').forEach(row => {
+    row.addEventListener('click', () => toggleDetail(row));
   });
 }
 
-function renderTail(t) {
+function summaryExtra(t) {
+  if (t.status === 'no_solution')
+    return ` · 冲突 seq=${t.conflict_seq ?? '?'}（第 ${t.conflict_row ?? '?'} 行）`;
+  if (t.status === 'multiple')
+    return ` · 候选链 ${t.solution_count}${t.solution_count_truncated ? '+' : ''} 条`;
+  if (t.status === 'error')
+    return ` · ${t.error_count || ''} 处行级错误`;
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// 懒加载：点开机尾时才请求该尾完整明细
+// ---------------------------------------------------------------------------
+async function toggleDetail(row) {
+  const tail = row.dataset.tail;
+  const idx = row.dataset.idx;
+  const box = $('detail-' + idx);
+  const caret = row.querySelector('.caret');
+  if (!box.hidden) {
+    box.hidden = true;
+    caret.textContent = '展开明细 ▾';
+    return;
+  }
+  box.hidden = false;
+  caret.textContent = '收起明细 ▴';
+  if (detailCache.has(tail)) {
+    box.innerHTML = renderTailDetail(detailCache.get(tail));
+    bindDetailButtons(box);
+    return;
+  }
+  box.innerHTML = '<p class="loading">⏳ 正在加载该机尾明细…</p>';
+  try {
+    const resp = await fetch(`/api/jobs/${encodeURIComponent(currentJob.job_id)}/tails/${encodeURIComponent(tail)}`);
+    const detail = await resp.json();
+    if (!resp.ok) throw new Error(detail.detail || '明细加载失败');
+    detailCache.set(tail, detail);
+    box.innerHTML = renderTailDetail(detail);
+    bindDetailButtons(box);
+  } catch (err) {
+    box.innerHTML = `<p class="loading">⚠ ${esc(err.message)}</p>`;
+  }
+}
+
+function bindDetailButtons(box) {
+  box.querySelectorAll('[data-export-tail]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      doExport(btn.dataset.exportTail);
+    });
+  });
+}
+
+function renderTailDetail(t) {
   const meta = STATUS_META[t.status];
   let body = '';
   if (t.status === 'unique') body = renderUnique(t);
@@ -293,12 +389,13 @@ function renderError(t) {
   return `<div class="error-box"><b>⛔ 数据错误，整架机尾禁止导出：</b><ul style="margin:6px 0">${items}</ul></div>`;
 }
 
+// ---------------------------------------------------------------------------
+// 导出：走作业流式接口（服务端重新求解复核，仅唯一解可导出）
+// ---------------------------------------------------------------------------
 async function doExport(tail) {
-  if (!currentFile) return;
-  const fd = new FormData();
-  fd.append('file', currentFile);
-  fd.append('tail', tail);
-  const resp = await fetch('/api/export', {method: 'POST', body: fd});
+  if (!currentJob) return;
+  const url = `/api/jobs/${encodeURIComponent(currentJob.job_id)}/export?tail=${encodeURIComponent(tail)}`;
+  const resp = await fetch(url);
   if (!resp.ok) {
     let msg = '导出被拒绝';
     try { msg = (await resp.json()).detail || msg; } catch (e) {}

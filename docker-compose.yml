@@ -4,4 +4,18 @@ services:
     container_name: dst-time-cleaner
     ports:
       - "8000:8000"
+    # 内存上限 256 MiB：清洗管道按机尾流式拆分/求解/导出，
+    # 1000 机尾 × 每机尾 100 段（10 万行）也不会把整批数据驻留内存。
+    mem_limit: 256m
+    mem_reservation: 192m
+    memswap_limit: 256m          # 禁止 swap 兜底，暴露真实内存占用
+    # Docker Swarm 下 mem_limit 不生效，需要用 resources.reservations/limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 192M
+    tmpfs:
+      - /app/.jobs:size=64m     # 作业 spool 放 tmpfs，受限且不落宿主机磁盘
     restart: unless-stopped
